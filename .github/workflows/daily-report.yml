@@ -1,6 +1,9 @@
 name: Daily investment report
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
   schedule:
     - cron: "0 9 * * 1-5"
@@ -16,7 +19,30 @@ permissions:
   id-token: write
 
 jobs:
+  publish-current:
+    if: github.event_name == 'push'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload current report
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+
+      - name: Deploy current report
+        id: deployment
+        uses: actions/deploy-pages@v4
+
   build:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     outputs:
