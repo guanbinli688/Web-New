@@ -1,0 +1,126 @@
+name: Daily investment report
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1-5"
+      timezone: "America/New_York"
+
+concurrency:
+  group: daily-investment-report
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      publish: ${{ steps.schedule.outputs.run_report }}
+    env:
+      PYTHONUTF8: "1"
+      AI_PROVIDER: openai
+      AI_MODEL: ${{ vars.AI_MODEL || 'gpt-5.4-mini' }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PROMPT_VERSION: v2.4-government-layout
+      HTTP_TIMEOUT: "25"
+      CACHE_TTL_HOURS: "20"
+      MARKET_COVERAGE_THRESHOLD: "0.80"
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: "465"
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      REPORT_TIMEZONE: America/New_York
+      PUBLIC_REPORT_URL: ${{ vars.PUBLIC_REPORT_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e ".[test]"
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Check NYSE trading day
+        id: schedule
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "run_report=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_report=$(python news_finance_v2.py --check-trading-day --base-dir .)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore prediction history
+        if: steps.schedule.outputs.run_report == 'true'
+        id: prediction-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: data/news_finance_v2.db
+          key: prediction-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            prediction-db-${{ github.ref_name }}-
+
+      - name: Verify due predictions
+        if: steps.schedule.outputs.run_report == 'true'
+        run: python news_finance_v2.py --verify --base-dir .
+
+      - name: Generate report and send email
+        if: steps.schedule.outputs.run_report == 'true'
+        run: python news_finance_v2.py --full --base-dir .
+
+      - name: Save prediction history
+        if: steps.schedule.outputs.run_report == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: data/news_finance_v2.db
+          key: ${{ steps.prediction-cache.outputs.cache-primary-key }}
+
+      - name: Stage public site
+        if: steps.schedule.outputs.run_report == 'true'
+        run: python -m news_finance_v2.publishing --base-dir .
+
+      - name: Commit latest public snapshot
+        if: steps.schedule.outputs.run_report == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A docs
+          git diff --cached --quiet || git commit -m "chore: update daily report $(date -u +%F)"
+          git push
+
+      - name: Configure GitHub Pages
+        if: steps.schedule.outputs.run_report == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        if: steps.schedule.outputs.run_report == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+
+  deploy:
+    if: needs.build.outputs.publish == 'true'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
